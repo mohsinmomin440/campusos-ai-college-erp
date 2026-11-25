@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+functions/node_modules/
+
+# Build & test outputs
+dist/
+build/
+coverage/
+playwright-report/
+test-results/
+.vite/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+functions/.env
+functions/.env.local
+functions/.secret.local
+*.pem
+*.key
+serviceAccountKey*.json
+*service-account*.json
+
+# Firebase local state & logs
+.firebase/
+.vercel/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+database-debug.log
+pubsub-debug.log
+
+# IDE & OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+.vercel
+.env*

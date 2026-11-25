@@ -1,0 +1,418 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Deny everything by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function isPlatformSuperAdmin() {
+      return isSignedIn() && (
+        ('platformRole' in request.auth.token &&
+         request.auth.token.platformRole == 'platform_super_admin') ||
+        (exists(userPath(request.auth.uid)) &&
+         get(userPath(request.auth.uid)).data.get('platformRole', '') == 'platform_super_admin')
+      );
+    }
+
+    function memberPath(tenantId, uid) {
+      return /databases/$(database)/documents/tenants/$(tenantId)/members/$(uid);
+    }
+
+    function hasMemberDoc(tenantId) {
+      return isSignedIn() && exists(memberPath(tenantId, request.auth.uid));
+    }
+
+    function memberData(tenantId) {
+      return get(memberPath(tenantId, request.auth.uid)).data;
+    }
+
+    function tenantPath(tenantId) {
+      return /databases/$(database)/documents/tenants/$(tenantId);
+    }
+
+    function isTenantActive(tenantId) {
+      return exists(tenantPath(tenantId)) &&
+        get(tenantPath(tenantId)).data.get('status', '') == 'active';
+    }
+
+    function isActiveMember(tenantId) {
+      return hasMemberDoc(tenantId) &&
+        memberData(tenantId).get('status', '') == 'active' &&
+        (isTenantActive(tenantId) || isPlatformSuperAdmin());
+    }
+
+    function memberRole(tenantId) {
+      return memberData(tenantId).get('role', '');
+    }
+
+    function hasRole(tenantId, allowedRoles) {
+      return isActiveMember(tenantId) && memberRole(tenantId) in allowedRoles;
+    }
+
+    function isLinkedStudent(tenantId, studentId) {
+      return isActiveMember(tenantId) &&
+        memberRole(tenantId) == 'parent' &&
+        memberData(tenantId).get('linkedStudentIds', []) is list &&
+        studentId in memberData(tenantId).get('linkedStudentIds', []);
+    }
+
+    function matchesTenant(tenantId) {
+      return request.resource.data.get('tenantId', '') == tenantId;
+    }
+
+    function isStaffReader(tenantId) {
+      return hasRole(tenantId, [
+        'platform_super_admin',
+        'college_admin',
+        'principal',
+        'hod',
+        'faculty',
+        'admission_officer',
+        'accountant',
+        'librarian',
+        'placement_officer',
+        'auditor'
+      ]);
+    }
+
+    // Global user profiles (safe metadata only)
+    match /users/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isPlatformSuperAdmin());
+      allow create: if isSignedIn() &&
+        request.auth.uid == uid &&
+        !('platformRole' in request.resource.data);
+      allow update: if isSignedIn() && (
+        isPlatformSuperAdmin() ||
+        (request.auth.uid == uid &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['platformRole', 'uid']))
+      );
+      allow delete: if isPlatformSuperAdmin();
+    }
+
+    // Platform bootstrap lock (written server-side only)
+    match /system/bootstrap {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
+    // Platform-level settings / plans (read by authenticated users, write by Platform Super Admin only)
+    match /platformPlans/{planId} {
+      allow read: if isSignedIn();
+      allow write: if isPlatformSuperAdmin();
+    }
+
+    // Tenant root
+    match /tenants/{tenantId} {
+      allow read: if isPlatformSuperAdmin() || hasMemberDoc(tenantId);
+      allow create: if isPlatformSuperAdmin();
+      allow update: if isPlatformSuperAdmin() || (
+        hasRole(tenantId, ['college_admin', 'principal']) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['status', 'subscriptionPlan', 'tenantId'])
+      );
+      allow delete: if false;
+
+      // Trusted tenant membership
+      match /members/{uid} {
+        allow read: if isPlatformSuperAdmin() ||
+          (isSignedIn() && request.auth.uid == uid) ||
+          isStaffReader(tenantId);
+        // Role creation & changes are restricted to Platform Super Admin, College Admin (cannot assign super admin or modify own role), or Cloud Functions
+        allow create: if isPlatformSuperAdmin() || (
+          hasRole(tenantId, ['college_admin']) &&
+          matchesTenant(tenantId) &&
+          request.resource.data.get('role', '') != 'platform_super_admin'
+        );
+        allow update: if isPlatformSuperAdmin() || (
+          hasRole(tenantId, ['college_admin']) &&
+          uid != request.auth.uid &&
+          request.resource.data.get('role', '') != 'platform_super_admin' &&
+          resource.data.get('role', '') != 'platform_super_admin' &&
+          matchesTenant(tenantId)
+        ) || (
+          isSignedIn() &&
+          request.auth.uid == uid &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'status', 'tenantId', 'linkedStudentIds', 'uid'])
+        );
+        allow delete: if isPlatformSuperAdmin();
+      }
+
+      // Pending member invitations (created/claimed by Cloud Functions only)
+      match /invitations/{inviteId} {
+        allow read: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'principal']) ||
+          (isSignedIn() && resource.data.get('email', '') == request.auth.token.get('email', ''));
+        allow write: if false;
+      }
+
+      // Academic structure & administration
+      match /departments/{docId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin']);
+      }
+
+      match /courses/{docId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin']);
+      }
+
+      match /subjects/{docId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin']);
+      }
+
+      match /academicYears/{docId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin']);
+      }
+
+      match /semesters/{docId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin']);
+      }
+
+      match /classes/{docId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin']);
+      }
+
+      match /timetables/{docId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod']);
+      }
+
+      // Admissions
+      match /admissions/{applicationId} {
+        allow read: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'admission_officer', 'auditor']);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'admission_officer'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      // Students & Guardians
+      match /students/{studentId} {
+        allow read: if isPlatformSuperAdmin() ||
+          isStaffReader(tenantId) ||
+          (isActiveMember(tenantId) && resource.data.get('uid', '') == request.auth.uid) ||
+          isLinkedStudent(tenantId, studentId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'admission_officer'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      match /guardians/{guardianId} {
+        allow read: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'principal', 'admission_officer', 'hod', 'faculty', 'accountant', 'auditor']) ||
+          (isActiveMember(tenantId) && resource.data.get('uid', '') == request.auth.uid);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'admission_officer'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      // Faculty & Staff
+      match /faculty/{facultyId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      match /staff/{staffId} {
+        allow read: if isPlatformSuperAdmin() || isStaffReader(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      // Attendance
+      match /attendance/{attendanceId} {
+        allow read: if isPlatformSuperAdmin() ||
+          isStaffReader(tenantId) ||
+          (isActiveMember(tenantId) && resource.data.get('studentUid', '') == request.auth.uid) ||
+          isLinkedStudent(tenantId, resource.data.get('studentId', ''));
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod', 'faculty'])) &&
+          matchesTenant(tenantId) &&
+          request.resource.data.get('status', '') in ['present', 'absent', 'late', 'excused'];
+        allow delete: if false;
+      }
+
+      match /attendanceCorrections/{correctionId} {
+        allow read: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod', 'faculty', 'auditor']);
+        allow create: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod', 'faculty'])) &&
+          matchesTenant(tenantId) &&
+          request.resource.data.get('status', '') == 'pending';
+        allow update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      // Examinations & Results
+      match /examinations/{examId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod', 'faculty'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      match /results/{resultId} {
+        allow read: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'principal', 'hod', 'faculty', 'auditor']) ||
+          (isActiveMember(tenantId) && resource.data.get('published', false) == true && resource.data.get('studentUid', '') == request.auth.uid) ||
+          (resource.data.get('published', false) == true && isLinkedStudent(tenantId, resource.data.get('studentId', '')));
+        // Draft marks only from authorized faculty/HOD; authoritative publication via Cloud Function
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod', 'faculty'])) &&
+          matchesTenant(tenantId) &&
+          request.resource.data.get('published', false) != true;
+        allow delete: if false;
+      }
+
+      // Finance (money stored in integer minor units; payments written server-side only)
+      match /feeStructures/{structureId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'accountant'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      match /invoices/{invoiceId} {
+        allow read: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'principal', 'accountant', 'auditor']) ||
+          (isActiveMember(tenantId) && resource.data.get('studentUid', '') == request.auth.uid) ||
+          isLinkedStudent(tenantId, resource.data.get('studentId', ''));
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'accountant'])) &&
+          matchesTenant(tenantId) &&
+          request.resource.data.totalMinor is int &&
+          request.resource.data.totalMinor >= 0;
+        allow delete: if false;
+      }
+
+      match /payments/{paymentId} {
+        allow read: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'principal', 'accountant', 'auditor']) ||
+          (isActiveMember(tenantId) && resource.data.get('studentUid', '') == request.auth.uid) ||
+          isLinkedStudent(tenantId, resource.data.get('studentId', ''));
+        // Payments & refunds must execute in trusted Cloud Functions for idempotency and audit logging
+        allow write: if false;
+      }
+
+      // Library
+      match /libraryBooks/{bookId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'librarian'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'librarian']);
+      }
+
+      match /bookLoans/{loanId} {
+        allow read: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'librarian', 'auditor']) ||
+          (isActiveMember(tenantId) && resource.data.get('studentUid', '') == request.auth.uid);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'librarian'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      // Placements
+      match /placements/{placementId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'placement_officer'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      match /placementApplications/{applicationId} {
+        allow read: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'principal', 'placement_officer', 'auditor']) ||
+          (isActiveMember(tenantId) && resource.data.get('studentUid', '') == request.auth.uid);
+        allow create: if matchesTenant(tenantId) && (
+          isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'placement_officer']) ||
+          (hasRole(tenantId, ['student']) &&
+           request.resource.data.get('studentUid', '') == request.auth.uid &&
+           request.resource.data.get('status', '') == 'applied')
+        );
+        allow update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'placement_officer'])) && matchesTenant(tenantId);
+        allow delete: if false;
+      }
+
+      // Communication, Events, Tickets, Notifications
+      match /notices/{noticeId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod', 'faculty', 'placement_officer'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal']);
+      }
+
+      match /events/{eventId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod', 'placement_officer'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal']);
+      }
+
+      match /tickets/{ticketId} {
+        allow read: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'principal', 'hod', 'auditor']) ||
+          (isActiveMember(tenantId) && (
+            resource.data.get('createdByUid', '') == request.auth.uid ||
+            resource.data.get('assignedToUid', '') == request.auth.uid
+          ));
+        allow create: if isActiveMember(tenantId) &&
+          matchesTenant(tenantId) &&
+          request.resource.data.get('createdByUid', '') == request.auth.uid;
+        allow update: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'principal', 'hod']) ||
+          (isActiveMember(tenantId) && resource.data.get('createdByUid', '') == request.auth.uid);
+        allow delete: if false;
+      }
+
+      match /notifications/{notificationId} {
+        allow read: if isPlatformSuperAdmin() ||
+          (isActiveMember(tenantId) && resource.data.get('recipientUid', '') == request.auth.uid);
+        allow create: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'hod', 'faculty', 'accountant', 'librarian'])) && matchesTenant(tenantId);
+        allow update: if isActiveMember(tenantId) &&
+          resource.data.get('recipientUid', '') == request.auth.uid &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['recipientUid', 'tenantId', 'message', 'title']);
+        allow delete: if false;
+      }
+
+      // Documents & Knowledge Base
+      match /documents/{documentId} {
+        allow read: if isPlatformSuperAdmin() ||
+          hasRole(tenantId, ['college_admin', 'principal', 'admission_officer', 'hod', 'auditor']) ||
+          (isActiveMember(tenantId) && (
+            resource.data.get('ownerUid', '') == request.auth.uid ||
+            resource.data.get('visibility', '') == 'tenant'
+          )) ||
+          isLinkedStudent(tenantId, resource.data.get('studentId', ''));
+        allow create: if isActiveMember(tenantId) &&
+          matchesTenant(tenantId) &&
+          (hasRole(tenantId, ['college_admin', 'principal', 'admission_officer', 'faculty']) ||
+           (request.resource.data.get('ownerUid', '') == request.auth.uid && request.resource.data.get('verified', false) == false));
+        allow update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'admission_officer', 'hod'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal']);
+      }
+
+      match /knowledgeDocuments/{docId} {
+        allow read: if isPlatformSuperAdmin() || isActiveMember(tenantId);
+        allow create, update: if (isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal'])) && matchesTenant(tenantId);
+        allow delete: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin']);
+      }
+
+      // Audit logs & AI Governance logs (immutable / server-written)
+      match /auditLogs/{logId} {
+        allow read: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'accountant', 'auditor']);
+        allow write: if false;
+      }
+
+      match /aiLogs/{logId} {
+        allow read: if isPlatformSuperAdmin() || hasRole(tenantId, ['college_admin', 'principal', 'auditor']);
+        allow write: if false;
+      }
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "campusos-functions",
+  "description": "Trusted server-side Cloud Functions for CampusOS",
+  "main": "src/index.js",
+  "type": "module",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "lint": "eslint src",
+    "test": "node --test tests/**/*.test.js",
+    "serve": "firebase emulators:start --only functions"
+  },
+  "dependencies": {
+    "@google/genai": "^0.14.0",
+    "firebase-admin": "^13.2.0",
+    "firebase-functions": "^6.3.2",
+    "zod": "^3.24.3"
+  },
+  "devDependencies": {
+    "firebase-functions-test": "^3.4.1"
+  }
+}

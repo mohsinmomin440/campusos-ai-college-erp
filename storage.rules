@@ -1,0 +1,57 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Deny everything by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function memberPath(tenantId) {
+      return /databases/(default)/documents/tenants/$(tenantId)/members/$(request.auth.uid);
+    }
+
+    function isActiveTenantMember(tenantId) {
+      return isSignedIn() &&
+        firestore.exists(memberPath(tenantId)) &&
+        firestore.get(memberPath(tenantId)).data.get('status', '') == 'active';
+    }
+
+    function memberRole(tenantId) {
+      return firestore.get(memberPath(tenantId)).data.get('role', '');
+    }
+
+    function isPrivilegedStaff(tenantId) {
+      return isActiveTenantMember(tenantId) &&
+        memberRole(tenantId) in ['platform_super_admin', 'college_admin', 'principal', 'admission_officer', 'hod', 'faculty'];
+    }
+
+    function isValidDocumentUpload() {
+      return request.resource != null &&
+        request.resource.size <= 5 * 1024 * 1024 &&
+        request.resource.contentType.matches('application/pdf|image/jpeg|image/png|image/webp');
+    }
+
+    // Tenant-scoped document uploads: /tenants/{tenantId}/{folder}/{ownerUid}/{fileName}
+    match /tenants/{tenantId}/{folder}/{ownerUid}/{fileName} {
+      allow read: if isActiveTenantMember(tenantId) && (
+        request.auth.uid == ownerUid ||
+        folder == 'knowledge' ||
+        isPrivilegedStaff(tenantId) ||
+        memberRole(tenantId) == 'auditor'
+      );
+
+      allow create, update: if isActiveTenantMember(tenantId) &&
+        folder in ['documents', 'admissions', 'certificates', 'knowledge'] &&
+        (request.auth.uid == ownerUid || isPrivilegedStaff(tenantId)) &&
+        isValidDocumentUpload();
+
+      allow delete: if isPrivilegedStaff(tenantId);
+    }
+  }
+}
